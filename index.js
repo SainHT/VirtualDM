@@ -1,88 +1,80 @@
-const { randomInt } = require('node:crypto');
+require('dotenv').config();
+
 const {
 	Client,
+	Collection,
 	Events,
 	GatewayIntentBits,
-	SlashCommandBuilder,
 } = require('discord.js');
 
+const { loadCommands } = require('./services/commandLoader');
+const { loadData } = require('./services/dataLoader');
+
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+client.commands = new Collection();
 
-const rollCommand = new SlashCommandBuilder()
-	.setName('roll')
-	.setDescription('Roll dice using standard D&D notation.')
-	.addStringOption((option) =>
-		option
-			.setName('expression')
-			.setDescription('The dice expression, e.g., 4d6+6')
-			.setRequired(true),
-	);
-
-const diceExpression = /^(\d+)d(\d+)([+-]\d+)?$/i;
-const MAX_DICE = 100;
-const MAX_SIDES = 100;
+for (const command of loadCommands()) {
+	client.commands.set(command.data.name, command);
+}
 
 client.once(Events.ClientReady, async (readyClient) => {
 	console.log(`Logged in as ${readyClient.user.tag}`);
 
 	try {
-		await readyClient.application.commands.set([rollCommand.toJSON()]);
-		console.log('Registered the /roll command');
+		await loadData();
+		const commandData = [...client.commands.values()]
+			.map((command) => command.data.toJSON());
+		const guilds = [...readyClient.guilds.cache.values()];
+
+		await Promise.all(
+			guilds.map((guild) => guild.commands.set(commandData)),
+		);
+		console.log(`Registered ${client.commands.size} slash commands in ${guilds.length} guild(s)`);
 	}
 	catch (error) {
-		console.error('Failed to register the /roll command:', error);
+		console.error('Failed to load data or register commands:', error);
 	}
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
-	if (!interaction.isChatInputCommand() || interaction.commandName !== 'roll') {
+	if (!interaction.isChatInputCommand()) {
 		return;
 	}
 
-	const originalExpression = interaction.options.getString('expression', true);
-	const normalizedExpression = originalExpression.replace(/\s/g, '');
-	const match = diceExpression.exec(normalizedExpression);
+	const command = client.commands.get(interaction.commandName);
+	if (!command) {
+		return;
+	}
 
-	if (!match) {
-		await interaction.reply({
-			content: 'Invalid expression. Use notation such as `4d6+6`, `1d20-2`, or `1d20`.',
+	try {
+		await command.execute(interaction);
+	}
+	catch (error) {
+		console.error(`Error executing /${interaction.commandName}:`, error);
+
+		const errorReply = {
+			content: 'There was an error while executing that command.',
 			ephemeral: true,
-		});
-		return;
+		};
+
+		if (interaction.replied || interaction.deferred) {
+			await interaction.followUp(errorReply);
+		}
+		else {
+			await interaction.reply(errorReply);
+		}
 	}
-
-	const diceCount = Number(match[1]);
-	const sides = Number(match[2]);
-	const modifier = match[3] ? Number(match[3]) : 0;
-
-	if (
-		!Number.isSafeInteger(diceCount) ||
-		!Number.isSafeInteger(sides) ||
-		!Number.isSafeInteger(modifier) ||
-		diceCount < 1 ||
-		diceCount > MAX_DICE ||
-		sides < 1 ||
-		sides > MAX_SIDES
-	) {
-		await interaction.reply({
-			content: `Expression is out of bounds. Use 1-${MAX_DICE} dice and 1-${MAX_SIDES} sides per die.`,
-			ephemeral: true,
-		});
-		return;
-	}
-
-	const rolls = Array.from({ length: diceCount }, () => randomInt(1, sides + 1));
-	const total = rolls.reduce((sum, roll) => sum + roll, modifier);
-	const modifierText = modifier === 0 ? 'None' : modifier > 0 ? `+${modifier}` : `${modifier}`;
-
-	await interaction.reply(
-		[
-			`**Expression:** \`${originalExpression}\``,
-			`**Rolls:** [${rolls.join(', ')}]`,
-			`**Modifier:** ${modifierText}`,
-			`**Total:** ${total}`,
-		].join('\n'),
-	);
 });
 
-client.login(process.env.discord_token);
+const discordToken = process.env.discord_token;
+
+if (!discordToken) {
+	console.error('Missing discord_token environment variable. Set it before starting the bot.');
+	process.exitCode = 1;
+}
+else {
+	client.login(discordToken).catch((error) => {
+		console.error('Discord login failed. Check that discord_token is valid:', error.message);
+		process.exitCode = 1;
+	});
+}
